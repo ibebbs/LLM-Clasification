@@ -1,0 +1,72 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Finetuning A Model
+Having seen that a zero-shot approach to feedback classification isn't feasible (see `ZeroShotInference.dib`) we're going to endeavour to fine-tune a LLM to see if we're able to improve classification accuracy.
+
+While fine-tuning a 7 billion parameter LLM is ordinarily an extremely lengthy and resource hungry operation, [Low Rank Adaptation (LoRA)](https://arxiv.org/abs/2106.09685) can be used to achieve similar results at a fraction of the computational cost. Moreover, LoRA models are small and can be interchanged easily meaning a single base LLM can be rapidly specialized for numerous purposes.
+
+## Preparing training data
+In order to fine-tune a language model, we must first prepare training data. For this, we're going to use the feedback data we extracted from the Asana API (see `FeedbackExtraction.dib`) which can be loaded as follows:
+
+#!csharp
+
+using System.IO;
+using Newtonsoft.Json;
+
+record FeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex);
+
+var json = await File.ReadAllTextAsync("./feedback.json");
+var feedbackItems = JsonConvert.DeserializeObject<FeedbackItem[]>(json);
+
+#!markdown
+
+Next we're going to map this data into JSON format expected by [LLaMA-LoRA Tuner](https://github.com/zetavg/LLaMA-LoRA-Tuner). This comprises of:
+1. An instruction prompt: `Predict the intent of the user given the utterance. Intent can be one of the following categories: 1) Something is broken; 2) Feature request; 3) Usability; 4) Other. Output 1 - 4 for each category.`,
+2. An input: The `Notes` property we extracted from Asana; and
+3. An expected output: The `FeedbackTypeIndex` we extracted from Asana (mapped to the 1-base indexes specified in the instruction prompt)
+
+#!csharp
+
+const string Instruction = "Predict the intent of the user given the utterance. Intent can be one of the following categories: 1) Something is broken; 2) Feature request; 3) Usability; 4) Other. Output 1 - 4 for each category.";
+
+string MapFeedbackTypeIndexToInstructionResult(int feedbackTypeIndex) => feedbackTypeIndex switch
+{
+    0 => "1",
+    1 => "2",
+    2 => "3",
+    3 => "4"
+};
+
+record JsonInstruction(string instruction, string input, string output);
+
+#!markdown
+
+With this in place we can go ahead and create the training data ...
+
+#!csharp
+
+var instructions = feedbackItems
+    .Select(feedbackItem => new JsonInstruction(Instruction, feedbackItem.Notes, MapFeedbackTypeIndexToInstructionResult(feedbackItem.FeedbackTypeIndex)))
+    .ToArray();
+
+#!markdown
+
+... then save it to a file
+
+#!csharp
+
+var serialized = JsonConvert.SerializeObject(instructions);
+
+await File.WriteAllTextAsync("./data/datasets/feedback_classification.json", serialized);
+
+#!markdown
+
+Unfortunately [LLaMA-LoRA Tuner](https://github.com/zetavg/LLaMA-LoRA-Tuner) doesn't offer an API for performing training so we need to open the UI in a browser and set the training file and parameters as shown below:
+
+![Training Settings](../images/Training%20Settings.png "Training Settings")
+
+With this done, we simply need to click the `Train` button and wait. On my machine with a NVidia A4500, training took 32 minutes for 6 epochs of 1000 samples.

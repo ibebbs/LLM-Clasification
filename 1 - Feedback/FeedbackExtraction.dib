@@ -1,0 +1,203 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Feedback Extraction
+Prior to any analysis, training or inferrence, we're going to download the feedback we're going to use from Asana.
+
+## Feedback Selection
+We're going to use the first 1000 feedback items (that have the feedback type specified) following the Windows Browser's release to open beta. We're using this data because:
+1. It provides sufficient data to be statistically relevant.
+2. At this point feedback was limited so we were able to take more time to triaged it carefully.
+
+#!markdown
+
+## Downloading Feedback from the Asana API
+Asana API documentation can be found here: `https://developers.asana.com/reference/rest-api-reference`
+
+To download feedback from the Asana API, we'll first need a Personal Access Token. You can generate one by visiting `https://app.asana.com/0/my-apps` and clicking `Create new token`.
+
+Once you have a token, set it in the code box below and execute it.
+
+#!csharp
+
+const string PersonalAccessToken = "";
+
+#!markdown
+
+Next we'll add a helper method to perform the actual Asana API query and return the result as a JSON string ...
+
+#!csharp
+
+#r "nuget: System.Linq.Async, 6.0.1"
+
+using System.IO;
+using System.Net.Http;
+using System.Text.RegularExpressions;
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+static async Task<string> Query(string url)
+{
+    //$"Querying Asana: {url}".Display();
+    HttpClient client = new HttpClient();
+    client.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", PersonalAccessToken);
+
+    HttpResponseMessage response = await client.GetAsync(url);
+
+    var json = await response.Content.ReadAsStringAsync();
+
+    return json;
+}
+
+#!markdown
+
+... and some constant Asana values...
+
+#!csharp
+
+const string FeedbackTypeFieldGid = "1199184518165813";
+const string WindowsFeedbackProjectGid = "1201279386299865";
+const string OffsetPattern = "&offset={0}";
+static readonly string WindowsFeedbackProjectQuery = $"https://app.asana.com/api/1.0/tasks?project={WindowsFeedbackProjectGid}&opt_fields=name,notes,completed,memberships.section.name,custom_fields.enum_value.{FeedbackTypeFieldGid}&created_since=2023-2-27T00%3A00%3A00Z&limit=100";
+static readonly string WindowsFeedbackStoryQuery = "https://app.asana.com/api/1.0/tasks/{0}/stories";
+
+const string GeneralFeedbackEnumGid = "1199184518165814";
+const string DesignFeedbackEnumGid = "1199214127353569";
+const string SomethingIsBrokenEnumGid = "1199184518165816";
+const string FeatureRequestEnumGid = "1199184518165815";
+const string OtherEnumGid = "1200574389728916";
+const string UsabilityEnumGid = "1204135764912065";
+
+static readonly string[] KnownFeedbackTypes = new [] { SomethingIsBrokenEnumGid, FeatureRequestEnumGid, UsabilityEnumGid, OtherEnumGid };
+
+#!markdown
+
+...and helper methods
+
+#!csharp
+
+static async IAsyncEnumerable<JObject> GetFeedbackItems(Func<JObject, bool> predicate)
+{
+    var query = WindowsFeedbackProjectQuery;
+    
+    do
+    {
+        var json = await Query(query);
+        var root = JObject.Parse(json);
+
+        // Calculate the next query value based on the offset
+        // This will be used to terminate the loop if there are no futher values
+        var offset = root.SelectToken("next_page.offset").Value<string>();
+        query = !string.IsNullOrWhiteSpace(offset)
+            ? $"{WindowsFeedbackProjectQuery}&offset={offset}"
+            : string.Empty;
+
+        var feedbackTokens = root.SelectToken("data") as JArray;
+
+        foreach (var feedbackToken in feedbackTokens.OfType<JObject>())
+        {
+            if (predicate(feedbackToken))
+            {
+                yield return feedbackToken;
+            }
+        }
+    } while (!string.IsNullOrWhiteSpace(query));
+}
+
+static bool HasFeedbackTypeValue(JObject feedback)
+{
+    var feedbackTypeToken = feedback.SelectToken($"custom_fields[?(@.gid == '{FeedbackTypeFieldGid}')].enum_value");
+
+    return (feedbackTypeToken is JObject);
+}
+
+const string FeedbackTextPattern = @"^(?<feedback>.+)---Category:\s(?<category>.+)Sub-category: (?<subcategory>.*)App Version: (?<appVersion>\d+\.\d+\.\d+)ATB: (?<atb>.*)Windows Version: (?<windowsVersion>.*)$";
+static readonly Regex FeedbackTextRegex = new Regex(FeedbackTextPattern, RegexOptions.Compiled);
+
+static string FeedbackText(JObject feedback)
+{
+    var rawNotes = feedback.GetValue("notes").Value<string>().Replace("\r", string.Empty).Replace("\n", string.Empty);
+
+    var match = FeedbackTextRegex.Match(rawNotes);
+
+    return match.Success
+        ? match.Groups["feedback"].Value
+        : string.Empty;
+}
+
+static bool HasValidFeedbackFormat(JObject feedback)
+{
+    var text = FeedbackText(feedback);
+
+    return !string.IsNullOrWhiteSpace(text);
+}
+
+static bool IsValidFeedback(JObject feedback)
+{
+    return HasFeedbackTypeValue(feedback) && HasValidFeedbackFormat(feedback);
+}
+
+const string FeedbackTypeChangePattern = @"^(?<User>.+) changed Feedback Type from ""(?<OldFeedbackType>[^""]+)"" to ""(?<NewFeedbackType>[^""]+)""$";
+static readonly Regex FeedbackTypeChangeRegex = new Regex(FeedbackTypeChangePattern, RegexOptions.Compiled);
+
+static async Task<bool> FeedbackTypeHasChanged(string gid)
+{
+    var json = await Query(string.Format(WindowsFeedbackStoryQuery, gid));
+    var root = JObject.Parse(json);
+    var data = root.SelectToken("data") as JArray;
+
+    foreach (var obj in data.OfType<JObject>())
+    {
+        var text = obj.GetValue("text").Value<string>();
+
+        if (FeedbackTypeChangeRegex.IsMatch(text))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+#!markdown
+
+Now will declare our destination type (`FeedbackItem`) and a mapping from the Asana JSON into this type.
+
+#!csharp
+
+record FeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex, bool FeedbackTypeHasChanged);
+
+static async Task<FeedbackItem> AsFeedbackItem(JObject feedback)
+{
+    var gid = feedback.GetValue("gid").Value<string>();
+    var notes = FeedbackText(feedback);    
+    var currentFeedbackType = feedback.SelectToken($"custom_fields[?(@.gid == '{FeedbackTypeFieldGid}')].enum_value.gid").Value<string>();
+    var feedbackTypeIndex = Array.IndexOf<string>(KnownFeedbackTypes, currentFeedbackType);
+    var feedbackTypeHasChanged = await FeedbackTypeHasChanged(gid);
+
+    return new FeedbackItem(gid, notes, currentFeedbackType, feedbackTypeIndex, feedbackTypeHasChanged);
+}
+
+#!markdown
+
+Finally we can use the above to extract 1000 items with valid feedback from the Asana API ...
+
+#!csharp
+
+var feedbackItems = await GetFeedbackItems(IsValidFeedback)
+    .SelectAwait(async feedback => await AsFeedbackItem(feedback))
+    .Take(1000)
+    .ToArrayAsync();
+
+#!markdown
+
+... and save the strongly typed records to a JSON file.
+
+#!csharp
+
+var file = JsonConvert.SerializeObject(feedbackItems);
+
+await File.WriteAllTextAsync("./feedback.json", file);

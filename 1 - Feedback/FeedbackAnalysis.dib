@@ -1,0 +1,82 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Feedback Analysis
+
+After extracting data from the Asana API (see `FeedbackExtraction.dib`) we're going to do some quick analysis to see how frequently our users misclassify feedback and if there are specific types of misclassification.
+
+We're want to plot this data on a chart so we're first going to import the Plotly library and bring it into scope.
+
+#!csharp
+
+#r "nuget: Plotly.NET.Interactive, 4.1.0"
+#r "nuget: Plotly.NET.CSharp, 0.10.0"
+
+using System.IO;
+using Newtonsoft.Json;
+using Plotly.NET.CSharp;
+
+#!markdown
+
+Next we'll load and deserialize the feedback extracted from the Asana API ...
+
+#!csharp
+
+record FeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex, bool FeedbackTypeHasChanged);
+
+var json = await File.ReadAllTextAsync("./feedback.json");
+var feedbackItems = JsonConvert.DeserializeObject<FeedbackItem[]>(json);
+
+#!markdown
+
+... and, for each type of feedback (i.e. "Something is broken", "Feature request", etc), calculate how often a Windows engineer needed to reclassify the feedback.
+
+#!csharp
+
+var analysed = feedbackItems
+    .GroupBy(feedbackItem => feedbackItem.FeedbackTypeIndex)
+    .Select(group => (FeedbackTypeIndex: group.Key, Count: group.Count(), Correct: group.Where(feedback => !feedback.FeedbackTypeHasChanged).Count()))
+    .Select(tuple => (FeedbackTypeIndex: tuple.FeedbackTypeIndex, Count: tuple.Count, Correct: tuple.Correct, CorrectPercent: ((double)tuple.Correct / (double)tuple.Count) * 100))
+    .OrderBy(tuple => tuple.FeedbackTypeIndex)
+    .ToArray();
+
+#!markdown
+
+Finally we can plot this data to a chart.
+
+We'll use a stacked column chart, with one column per feedback type showing the percent of correct and incorrect categorization. We'll also add an "Overall" column showing how well our users do overall.
+
+#!csharp
+
+var groupLabels = new []
+{
+    $"Overall (Count: {analysed.Sum(group => group.Count)})",
+    $"Something Is Broken (Count: {analysed.Where(group => group.FeedbackTypeIndex == 0).Sum(group => group.Count)})", 
+    $"Feature Request (Count: {analysed.Where(group => group.FeedbackTypeIndex == 1).Sum(group => group.Count)})", 
+    $"Usability (Count: {analysed.Where(group => group.FeedbackTypeIndex == 2).Sum(group => group.Count)})",
+    $"Other (Count: {analysed.Where(group => group.FeedbackTypeIndex == 3).Sum(group => group.Count)})"
+};
+
+Plotly.NET.CSharp.Chart
+    .Combine(
+        new []
+        {
+            Plotly.NET.CSharp.Chart.StackedColumn<double, string, string>(analysed.Select(tuple => tuple.CorrectPercent).ToArray().Prepend(analysed.Select(tuple => tuple.CorrectPercent).Average()), groupLabels, "Correct %"),
+            Plotly.NET.CSharp.Chart.StackedColumn<double, string, string>(analysed.Select(tuple => 100 - tuple.CorrectPercent).ToArray().Prepend(analysed.Select(tuple => 100 - tuple.CorrectPercent).Average()), groupLabels, "Incorrect %")
+        })
+    .WithSize(Width: 1024, Height: 1024)
+    .Display();
+
+#!markdown
+
+## Conclusion
+
+From the above we can conclude the following:
+* Users provide an incorrect classification around 28% of the time.
+* This incorrect classification value is heavily biased by the "Usability" category which is incorrect 100% of the time. This isn't entirely the users fault thought as the "Usability" classification isn't presented to the them and is therefore only ever used internally.
+* The second biggest category of misclassification is "Something Is Broken" with 7% of reports incorrect.
+
+Overall, users are fairly accurate in reporting feedback but a Windows engineer is still needed to triage the reports and correct the classification in many cases, particularly when the feedback relates to usability.

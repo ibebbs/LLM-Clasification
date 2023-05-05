@@ -1,0 +1,137 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Zero-shot Inference
+New we have data extracted from the Asana API (see `FeedbackExtraction.dib`), and fine-tuned a model (see `FinetuneTraining.dib`) we're going to use it to see how well a fine-tuned LLM performs in clasifying feedback.
+
+We're going to spin up [LLaMA-LoRA Tuner](https://github.com/zetavg/LLaMA-LoRA-Tuner) in a docker container (see `readme.md`) and use it's REST API to perform inference.
+
+## Setup
+We're first going add some libraries ...
+
+#!csharp
+
+#r "nuget: System.Linq.Async, 6.0.1"
+
+using System.IO;
+using System.Net.Http;
+using Newtonsoft.Json;
+
+#!markdown
+
+... and helper methods ...
+
+#!csharp
+
+const string FinetunedLoraFile = "/data/lora_models/feedback-classification-2023-05-04-14-10-40";
+static readonly string InferrenceEndpoint = "http://localhost:7860/run/inference";
+static readonly string InferrenceContentPattern = @"{
+    ""data"": [
+        ""{LoraFile}"",
+		""alpaca_sample"",
+		""Predict the intent of the user given the utterance. Intent can be one of the following categories: 1) Something is broken; 2) Feature request; 3) Usability; 4) Other. Output 1 - 4 for each category."",
+		""{Text}"",
+		"""",
+		"""",
+		"""",
+		"""",
+		"""",
+		"""",
+		0.1,
+		0.75,
+		40,
+		2,
+		1.2,
+		2,
+		false,
+		false
+	]
+}";
+
+static async Task<int> Infer(string text)
+{    
+    HttpClient client = new HttpClient();
+    
+    var jsonContent = InferrenceContentPattern.Replace("{LoraFile}", FinetunedLoraFile).Replace("{Text}", text);
+    
+    var httpContent = new StringContent(jsonContent, Encoding.UTF8, "application/json");
+
+    var response = await client.PostAsync(InferrenceEndpoint, httpContent);
+
+    var json = await response.Content.ReadAsStringAsync();
+
+    var responseContent = await response.Content.ReadAsStringAsync();
+
+    var jsonDocument = System.Text.Json.JsonDocument.Parse(responseContent);
+
+    try
+    {
+        var value = jsonDocument.RootElement.GetProperty("data").EnumerateArray().Select(node => node.GetProperty("value").GetString()).FirstOrDefault();
+
+        return value[0] switch
+        {
+            '1' => 0,
+            '2' => 1,
+            '3' => 2,
+            '4' => 3,
+            _ => -1
+        };
+    }
+    catch
+    {
+        return -1;
+    }
+}
+
+#!markdown
+
+Then we're going to load the feedback we extracted from the Asana API ...
+
+#!csharp
+
+record FeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex);
+
+var json = await File.ReadAllTextAsync("../1 - Feedback/feedback.json");
+var feedbackItems = JsonConvert.DeserializeObject<FeedbackItem[]>(json);
+
+#!markdown
+
+... and define the type we want to use to record the inferred results, along with a map from `FeedbackItem` to `InferredFeedbackItem`.
+
+#!csharp
+
+record FineTunedFeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex, int InferredFeedbackTypeIndex);
+
+static async Task<FineTunedFeedbackItem> ToInferredFeedbackTypeItem(FeedbackItem feedbackItem)
+{
+    var inferredFeedbackType = await Infer(feedbackItem.Notes);
+
+    return new FineTunedFeedbackItem(feedbackItem.Gid, feedbackItem.Notes, feedbackItem.FeedbackType, feedbackItem.FeedbackTypeIndex, inferredFeedbackType);
+}
+
+#!markdown
+
+## Inference
+Now we're able to perform our inference by enumerating through the feedback and using the [LLaMA-LoRA Tuner](https://github.com/zetavg/LLaMA-LoRA-Tuner) api to perform inference.
+
+#!csharp
+
+var inferredFeedbackItems = await feedbackItems
+    .ToAsyncEnumerable()
+    .SelectAwait(async feedbackItem => await ToInferredFeedbackTypeItem(feedbackItem))
+    .ToArrayAsync();
+
+#!markdown
+
+> (Note: Inferrence of 1000 items took 4m 44.6 seconds; just 284ms per inferrence)
+
+Finally we'll save the output to a file for analysis (see `FinetunedInferrenceResults.dib`)
+
+#!csharp
+
+var file = JsonConvert.SerializeObject(inferredFeedbackItems);
+
+await File.WriteAllTextAsync("./FinetunedInferrenceResults.json", file);

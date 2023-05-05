@@ -1,0 +1,81 @@
+#!meta
+
+{"kernelInfo":{"defaultKernelName":"csharp","items":[{"aliases":[],"languageName":"csharp","name":"csharp"}]}}
+
+#!markdown
+
+# Analysis of Zero-Shot Inferrence
+
+After extracting data from the Asana API (see `FeedbackExtraction.dib`) and performing inferrence using the base LLM (see `ZeroShotInference.dib`) we're going to do some quick analysis to see well our zero-shot LLM performed
+
+We're want to plot this data on a chart so we're first going to import the Plotly library and bring it into scope.
+
+#!csharp
+
+#r "nuget: Plotly.NET.Interactive, 4.1.0"
+#r "nuget: Plotly.NET.CSharp, 0.10.0"
+
+using System.IO;
+using Newtonsoft.Json;
+using Plotly.NET.CSharp;
+
+#!markdown
+
+Next we'll load and deserialize the feedback categorized by our fine-tuned LLM ...
+
+#!csharp
+
+record InferredFeedbackItem(string Gid, string Notes, string FeedbackType, int FeedbackTypeIndex, int InferredFeedbackTypeIndex);
+
+var json = await File.ReadAllTextAsync("./ZeroShotInferrenceResults.json");
+var inferredFeedbackItems = JsonConvert.DeserializeObject<InferredFeedbackItem[]>(json);
+
+#!markdown
+
+... and, for each type of feedback (i.e. "Something is broken", "Feature request", etc), calculate how often the fine-tuned LLM correctly classified the feedback.
+
+#!csharp
+
+var analysed = inferredFeedbackItems
+    .GroupBy(feedbackItem => feedbackItem.FeedbackTypeIndex)
+    .Select(group => (FeedbackTypeIndex: group.Key, Count: group.Count(), Correct: group.Where(feedback => feedback.InferredFeedbackTypeIndex == feedback.FeedbackTypeIndex).Count()))
+    .Select(tuple => (FeedbackTypeIndex: tuple.FeedbackTypeIndex, Count: tuple.Count, Correct: tuple.Correct, CorrectPercent: ((double)tuple.Correct / (double)tuple.Count) * 100))
+    .OrderBy(tuple => tuple.FeedbackTypeIndex)
+    .ToArray();
+
+#!markdown
+
+Finally we can plot this data to a chart.
+
+We'll use a stacked column chart, with one column per feedback type showing the percent of correct and incorrect categorization. We'll also add an "Overall" column showing how well our users do overall.
+
+#!csharp
+
+static readonly String[] GroupLabels = new []
+{
+    "Overall",
+    "Something Is Broken", 
+    "Feature Request", 
+    "Usability",
+    "Other"
+};
+
+Plotly.NET.CSharp.Chart
+    .Combine(
+        new []
+        {
+            Plotly.NET.CSharp.Chart.StackedColumn<double, string, string>(analysed.Select(tuple => tuple.CorrectPercent).ToArray().Prepend(analysed.Select(tuple => tuple.CorrectPercent).Average()), GroupLabels, "Correct %"),
+            Plotly.NET.CSharp.Chart.StackedColumn<double, string, string>(analysed.Select(tuple => 100 - tuple.CorrectPercent).ToArray().Prepend(analysed.Select(tuple => 100 - tuple.CorrectPercent).Average()), GroupLabels, "Incorrect %")
+        })
+    .WithSize(Width: 1024, Height: 1024)
+    .Display();
+
+#!markdown
+
+## Conclusion
+
+From the above we can conclude the following:
+* Zero-shot inferrence provides an incorrect classification around 81% of the time.
+* While zero-shot inferrence is able to determine when "Something is broken" with 72% accuracy, most of the other categories perform dismally
+
+Overall, Zero-shot inferrence is in no way usable for performaing automated classification of feedback.
